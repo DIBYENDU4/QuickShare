@@ -3,11 +3,14 @@ import time
 import uuid
 import zipfile
 import threading
+import json
 from flask import Flask, render_template, request, jsonify, send_from_directory
 import qrcode
 
 UPLOAD_FOLDER = "uploads"
 QR_FOLDER = "static/qr"
+DB_FILE = "file_db.json"
+
 MAX_SIZE = 100 * 1024 * 1024
 EXPIRY_TIME = 3600
 
@@ -15,32 +18,58 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(QR_FOLDER, exist_ok=True)
 
 app = Flask(__name__)
-file_db = {}
+
+# ---------- DATABASE HELPERS ----------
+def load_db():
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_db(data):
+    with open(DB_FILE, "w") as f:
+        json.dump(data, f)
+
+file_db = load_db()
 
 def generate_code():
     return str(uuid.uuid4().int)[:6]
 
+# ---------- CLEANUP THREAD ----------
 def cleanup():
+    global file_db
     while True:
         now = time.time()
+        file_db = load_db()
+        changed = False
+
         for code in list(file_db.keys()):
             if now > file_db[code]["expiry"]:
                 try:
-                    os.remove(file_db[code]["file"])
-                    os.remove(file_db[code]["qr"])
+                    if os.path.exists(file_db[code]["file"]):
+                        os.remove(file_db[code]["file"])
+                    if os.path.exists(file_db[code]["qr"]):
+                        os.remove(file_db[code]["qr"])
                 except:
                     pass
                 del file_db[code]
+                changed = True
+
+        if changed:
+            save_db(file_db)
+
         time.sleep(60)
 
 threading.Thread(target=cleanup, daemon=True).start()
 
+# ---------- ROUTES ----------
 @app.route("/")
 def index():
     return render_template("index.html")
 
 @app.route("/upload", methods=["POST"])
 def upload():
+    global file_db
     files = request.files.getlist("files")
     if not files:
         return jsonify({"error": "No files selected"})
@@ -54,25 +83,31 @@ def upload():
 
     code = generate_code()
 
+    # SINGLE FILE
     if len(files) == 1:
         f = files[0]
-        path = os.path.join(UPLOAD_FOLDER, f"{code}_{f.filename}")
-        f.save(path)
+        file_path = os.path.join(UPLOAD_FOLDER, f"{code}_{f.filename}")
+        f.save(file_path)
+
+    # MULTIPLE FILES
     else:
-        path = os.path.join(UPLOAD_FOLDER, f"{code}.zip")
-        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        file_path = os.path.join(UPLOAD_FOLDER, f"{code}.zip")
+        with zipfile.ZipFile(file_path, "w", zipfile.ZIP_DEFLATED) as z:
             for f in files:
                 z.writestr(f.filename, f.read())
 
     link = request.host_url + f"download/{code}"
+
     qr_path = f"{QR_FOLDER}/{code}.png"
     qrcode.make(link).save(qr_path)
 
     file_db[code] = {
-        "file": path,
+        "file": file_path,
         "qr": qr_path,
         "expiry": time.time() + EXPIRY_TIME
     }
+
+    save_db(file_db)
 
     return jsonify({
         "code": code,
@@ -83,17 +118,29 @@ def upload():
 
 @app.route("/getfile", methods=["POST"])
 def getfile():
+    global file_db
+    file_db = load_db()
+
     code = request.form.get("code")
     if code not in file_db:
         return jsonify({"error": "Invalid or expired code"})
-    return jsonify({"link": request.host_url + f"download/{code}"})
+
+    return jsonify({
+        "link": request.host_url + f"download/{code}"
+    })
 
 @app.route("/download/<code>")
 def download(code):
+    global file_db
+    file_db = load_db()
+
     if code not in file_db:
         return "Invalid or expired"
 
     file_path = file_db[code]["file"]
+    if not os.path.exists(file_path):
+        return "File not found or expired"
+
     stored = os.path.basename(file_path)
 
     if "_" in stored and not stored.endswith(".zip"):
@@ -108,7 +155,7 @@ def download(code):
         download_name=download_name
     )
 
-# 🔥 REQUIRED FOR RENDER
+# ---------- RENDER ENTRY ----------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
